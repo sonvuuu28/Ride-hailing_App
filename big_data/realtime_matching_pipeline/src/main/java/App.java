@@ -1,84 +1,139 @@
-import org.apache.flink.api.common.functions.MapFunction; // Hàm map chuyển đổi từng phần tử
-import org.apache.flink.api.common.serialization.SimpleStringSchema; // Giải mã dữ liệu thành chuỗi (Kafka trả data là byte, ông này giải mã sang string)
-import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment; // Khởi tạo môi trường flink
-import org.apache.flink.streaming.api.datastream.DataStream; // Kiểu dữ liệu 
-import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer; // Connector Flink-Kafka
+// =================== FLINK CORE ===================
+import org.apache.flink.api.common.functions.MapFunction;       // Map transformation on each event
+import org.apache.flink.api.common.serialization.SimpleStringSchema; // Decode byte data from Kafka to String
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment; // Flink execution environment
+import org.apache.flink.streaming.api.datastream.DataStream;    // Flink stream type
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction; // Process function per key
+import org.apache.flink.util.Collector;                         // Collector to emit new event
 
-import java.util.Properties;
+// =================== FLINK STATE ===================
+import org.apache.flink.api.common.state.ValueState;           // State to store a single value per key
+import org.apache.flink.api.common.state.ValueStateDescriptor; // Descriptor for ValueState
 
-import com.fasterxml.jackson.databind.ObjectMapper; // JSON ↔ Java object
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+// =================== FLINK CONFIG ===================
+import org.apache.flink.configuration.Configuration;           // Extended configuration (used in open method)
 
-import org.apache.flink.api.common.state.ValueState;
-import org.apache.flink.api.common.state.ValueStateDescriptor;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
-import org.apache.flink.util.Collector;
+// =================== KAFKA ===================
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer; 
+
+// =================== JSON ===================
+import com.fasterxml.jackson.databind.ObjectMapper;            // JSON <-> Java object mapping
+import com.fasterxml.jackson.databind.SerializationFeature;    // Jackson serialization config
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;   // Support for LocalDateTime
+
+// =================== JAVA CORE ===================
+import java.util.Properties;                                   // Kafka configuration
+import java.time.Duration;                                     // Time difference calculation
 
 
 public class App {
 
-    public double calculate_Haversine(double lat1, double lng1, double lat2, double lng2) {
-        final double R = 6731; // Độ trái đất
+    // =================== CASE 1: Limit GPS events to HCM city ===================
+    public static DataStream<gpsDTO> limit_area(DataStream<gpsDTO> df) {
+        return df.filter(dto -> dto.getLatitude() >= 10.7 && dto.getLatitude() <= 10.9 
+            && dto.getLongitude() >= 106.6 && dto.getLongitude() <= 106.8); 
+    }
+
+    // =================== CASE 2-4: Process abnormal GPS events ===================
+    // Case 2: Detect abnormal speed (> 100 km/h)
+    // Case 3: Handle reply events from Kafka
+    // Case 4: Prevent spam based on status (available, no_available, on_trip)
+    public static double calculate_Haversine(double lat1, double lng1, double lat2, double lng2) {
+        final double R = 6371; // Earth radius in km
 
         double deltaLat = Math.toRadians(lat2-lat1); 
         double deltaLng = Math.toRadians(lng2-lng1); 
 
-        // Haversine
-        // a = sin(1/2 * delta(lat))^2 + cos(lat1) * cos(lat2) * sin(1/2 * deltaLng)^2
-        double a = Math.sin(deltaLat/2) * Math.sin(deltaLat/2) + Math.cos(lat1) * Math.cos(lat2) * Math.sin(deltaLng/2) * Math.sin(deltaLng/2)
+        // Haversine formula to calculate distance between two points on Earth
+        double a = Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2)
+                + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) * Math.sin(deltaLng / 2) * Math.sin(deltaLng / 2);
         double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
         return R * c;
     }
 
-    public void process_abnormal_gps(DataStream<gpsDTO> df){
-        df.keyBy(dto -> dto.getId()).process(new KeyedProcessFunction<String, gpsDTO, String>() {
+    public static DataStream<gpsDTO> process_abnormal_gps(DataStream<gpsDTO> df){
+        // Key by driver ID
+        return df.keyBy(dto -> dto.getId()).process(new KeyedProcessFunction<String, gpsDTO, gpsDTO>() {
+            // Thresholds
+            private int speed_threshold = 100;          // Max speed in km/h
+
+            // State to store previous GPS
             private ValueState<gpsDTO> prev_gpsDTO;
 
-            // Khởi tạo state
             @Override
-            public void open() {
-                prev_gpsDTO = getRuntimeContext().getState(new ValueStateDescriptor<>("previous-GPS", gpsDTO.class));
+            public void open(Configuration parameters) {
+                // Previous GPS per driver
+                ValueStateDescriptor<gpsDTO> prevDesc = new ValueStateDescriptor<>("previous-GPS", gpsDTO.class);
+                prev_gpsDTO = getRuntimeContext().getState(prevDesc);
             }
 
             @Override
-            public void processElement(gpsDTO current_gpsDTO, Context ctx, Collector<String> out) throws Exception {
-                gpsDTO last = prev_gpsDTO.value();
+            public void processElement(gpsDTO current, Context ctx, Collector<gpsDTO> out) throws Exception {
+                // Get previous GPS
+                gpsDTO previous = prev_gpsDTO.value();
+
+                // Null-safe check previous
+                if (previous == null) {
+                    prev_gpsDTO.update(current);
+                    out.collect(current);
+                    return;
+                }
+
+                // Calculate time difference, distance, and speed
+                long deltaSeconds = Duration.between(previous.getTimestamp(), current.getTimestamp()).getSeconds();
+                double distance = calculate_Haversine(previous.getLatitude(), previous.getLongitude(), current.getLatitude(), current.getLongitude());
+                double speed = distance * 3600 / Math.max(deltaSeconds, 1); // If delta = 0, assign 1 to variable 'speed'. 1 will make an invalid event
+                boolean isInvalid = deltaSeconds <= 0 || speed >= speed_threshold;
+
+                // Handle invalid GPS
+                if(isInvalid){
+                    out.collect(previous);
+                    return;
+                }
+
+                // Prevent spamming small movements
+                if(speed < speed_threshold){
+                    if(current.getStatus().equals("on_trip") && deltaSeconds <= 1) return;
+                    if(current.getStatus().equals("available") && deltaSeconds <= 5) return;
+                    if(current.getStatus().equals("no_available") && deltaSeconds <= 30) return;
+                }
+                
+                // Emit valid event
+                out.collect(current);
+                prev_gpsDTO.update(current);
             }
         });
     }
 
-    public static void main(String[] args) throws Exception {
-
-        // 1. Tạo environment
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-
-        // 2. Cấu hình Kafka
+    // =================== KAFKA CONFIG ===================
+    public static Properties config_kafka(){
         Properties prop = new Properties();
-        prop.setProperty("bootstrap.servers", "broker:29092"); // Kafka broker
-        prop.setProperty("group.id", "flink-gps-group"); // Consumer group
+        prop.setProperty("bootstrap.servers", "broker:29092"); // Kafka broker address
+        prop.setProperty("group.id", "flink-gps-group");       // Consumer group
+        return prop;
+    }
 
-        // 3. Kafka consumer
+    public static FlinkKafkaConsumer connect_consumer(String topic_name, Properties prop){
         FlinkKafkaConsumer<String> consumer = new FlinkKafkaConsumer<>(
-                "gps-topic",
+                topic_name,
                 new SimpleStringSchema(),
                 prop
         );
+        
+        return consumer;
+    }
 
-        // 4. Thêm source
-        DataStream<String> df_raw = env.addSource(consumer);
-
-        // 5. Transformation
-        // JSON -> gpsDTO
-        DataStream<gpsDTO> df_mapped = df_raw.map(new MapFunction<String, gpsDTO>() {
+    // =================== JSON TRANSFORMATION ===================
+    public static DataStream<gpsDTO> transfer_JSON_to_JavaObj(DataStream<String> df_raw) {
+        // Convert JSON string to gpsDTO object
+        DataStream<gpsDTO> df = df_raw.map(new MapFunction<String, gpsDTO>() {
             @Override
             public gpsDTO map(String value) {
                 try {
-                    ObjectMapper mapper = new ObjectMapper(); // Khai báo kiểu dữ liệu của Jackson để parse JSON sang Java Obj
-                    mapper.registerModule(new com.fasterxml.jackson.datatype.jsr310.JavaTimeModule()); // Đăng ký module để hiểu các kiểu tgian
-                    mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS); // Tắt chế độ chuyển ngày giờ sang số 
+                    ObjectMapper mapper = new ObjectMapper();     // Jackson Datatype
+                    mapper.registerModule(new JavaTimeModule()); // support LocalDateTime
+                    mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS); // disable timestamp format (it will not transfer TS to INT)
 
                     return mapper.readValue(value, gpsDTO.class);
                 } catch (Exception e) {
@@ -87,20 +142,27 @@ public class App {
                 }
             }
         });
-        
-        // Loại bỏ null
-        DataStream<gpsDTO> df_final = df_mapped.filter(dto -> dto != null);
 
-        // Lat & Lng thuộc vào Tp. HCM
-        df_final = df_final.filter(dto -> 
-            dto.getLatitude() >= 10.7 &&
-            dto.getLatitude() <= 10.9 &&
-            dto.getLongitude() >= 106.6 &&
-            dto.getLongitude() <= 106.8
-        );
-        
-        // 7. Thực thi job
-        env.execute("GPS pipeline");
+        return df;
+    }
 
+    // =================== FULL TRANSFORMATION PIPELINE ===================
+    public static DataStream<gpsDTO> transform_data(DataStream<String> df_raw){
+        DataStream<gpsDTO> df1 = transfer_JSON_to_JavaObj(df_raw);      // JSON -> Object
+        DataStream<gpsDTO> df2 = df1.filter(dto -> dto != null);        // Drop null
+        DataStream<gpsDTO> df3 = limit_area(df2);                       // Limit area to HCM
+        DataStream<gpsDTO> df4 = process_abnormal_gps(df3);             // Process abnormal GPS
+        return df4;
+    }
+
+    // =================== MAIN ===================
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(); // Create Flink environment
+        Properties prop = config_kafka();                                                     // Kafka properties
+        FlinkKafkaConsumer<String> consumer = connect_consumer("gps-topic", prop);           // Kafka consumer
+        DataStream<String> df_raw = env.addSource(consumer);                                  // Add Kafka source
+        DataStream<gpsDTO> df = transform_data(df_raw);                                       // Apply transformations
+        df.print();                                                                           // Print output
+        env.execute("GPS pipeline");                                                          // Execute Flink job
     }
 }
