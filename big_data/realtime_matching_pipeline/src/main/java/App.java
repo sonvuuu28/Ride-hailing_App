@@ -1,5 +1,6 @@
 // =================== FLINK CORE ===================
 import org.apache.flink.api.common.functions.MapFunction;       // Map transformation on each event
+import org.apache.flink.api.common.functions.RichMapFunction;
 import org.apache.flink.api.common.serialization.SimpleStringSchema; // Decode byte data from Kafka to String
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment; // Flink execution environment
 import org.apache.flink.streaming.api.datastream.DataStream;    // Flink stream type
@@ -13,8 +14,8 @@ import org.apache.flink.api.common.state.ValueStateDescriptor; // Descriptor for
 // =================== FLINK CONFIG ===================
 import org.apache.flink.configuration.Configuration;           // Extended configuration (used in open method)
 
-// =================== KAFKA ===================
-import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer; 
+// =================== Connector ===================
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer; // Kafka
 
 // =================== JSON ===================
 import com.fasterxml.jackson.databind.ObjectMapper;            // JSON <-> Java object mapping
@@ -120,30 +121,31 @@ public class App {
                 new SimpleStringSchema(),
                 prop
         );
-        
+
         return consumer;
     }
 
     // =================== JSON TRANSFORMATION ===================
     public static DataStream<gpsDTO> transfer_JSON_to_JavaObj(DataStream<String> df_raw) {
-        // Convert JSON string to gpsDTO object
-        DataStream<gpsDTO> df = df_raw.map(new MapFunction<String, gpsDTO>() {
+        return df_raw.map(new RichMapFunction<String, gpsDTO>() {
+
+            private transient ObjectMapper mapper;
+
+            @Override
+            public void open(Configuration parameters) {
+                mapper = new ObjectMapper().registerModule(new JavaTimeModule())
+                    .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+            }
+
             @Override
             public gpsDTO map(String value) {
                 try {
-                    ObjectMapper mapper = new ObjectMapper();     // Jackson Datatype
-                    mapper.registerModule(new JavaTimeModule()); // support LocalDateTime
-                    mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS); // disable timestamp format (it will not transfer TS to INT)
-
                     return mapper.readValue(value, gpsDTO.class);
                 } catch (Exception e) {
-                    System.err.println("Cannot parse JSON: " + value);
                     return null;
                 }
             }
         });
-
-        return df;
     }
 
     // =================== FULL TRANSFORMATION PIPELINE ===================
@@ -158,11 +160,16 @@ public class App {
     // =================== MAIN ===================
     public static void main(String[] args) throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(); // Create Flink environment
-        Properties prop = config_kafka();                                                     // Kafka properties
-        FlinkKafkaConsumer<String> consumer = connect_consumer("gps-topic", prop);           // Kafka consumer
+
+        Properties Kafka_prop = config_kafka();                                                     // Kafka properties
+        FlinkKafkaConsumer<String> consumer = connect_consumer("gps-topic", Kafka_prop);           // Kafka consumer
+        
         DataStream<String> df_raw = env.addSource(consumer);                                  // Add Kafka source
         DataStream<gpsDTO> df = transform_data(df_raw);                                       // Apply transformations
-        df.print();                                                                           // Print output
+
+        df.print();
+        df.addSink(new DriverGpsRedisSink());
+
         env.execute("GPS pipeline");                                                          // Execute Flink job
     }
 }

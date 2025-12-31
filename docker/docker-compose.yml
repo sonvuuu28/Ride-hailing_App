@@ -11,7 +11,7 @@ services:
       - redis-data:/data
       - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
     networks:
-      - redis-project
+      - ride-hailing-project
 
   # Kafka using as a data hub
   broker:
@@ -38,6 +38,8 @@ services:
       KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
       KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
       CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    networks:
+      - ride-hailing-project
 
   schema-registry:
     image: confluentinc/cp-schema-registry:8.0.0
@@ -67,6 +69,8 @@ services:
       rest.bind-port: 9081
     volumes:
     - ../big_data/realtime_matching_pipeline/:/app
+    networks:
+      - ride-hailing-project
 
   flink-taskmanager:
     image: cnfldemos/flink-kafka:1.19.1-scala_2.12-java17
@@ -83,7 +87,8 @@ services:
       taskmanager.numberOfTaskSlots: 10
     volumes:
     - ../big_data/realtime_matching_pipeline/:/app
-
+    networks:
+      - ride-hailing-project
   
   # Pipeline 1: realtime_matching
   test_container:
@@ -98,5 +103,5 @@ volumes:
   redis-data:
   
 networks:
-  redis-project:
+  ride-hailing-project:
     driver: bridge
