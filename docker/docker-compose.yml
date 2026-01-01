@@ -9,7 +9,7 @@ services:
       - "6379:6379"
     volumes:
       - redis-data:/data
-      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+      - ./Redis/redis.conf:/usr/local/etc/redis/redis.conf
     networks:
       - ride-hailing-project
 
@@ -40,19 +40,6 @@ services:
       CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
     networks:
       - ride-hailing-project
-
-  schema-registry:
-    image: confluentinc/cp-schema-registry:8.0.0
-    hostname: schema-registry
-    container_name: schema-registry
-    depends_on:
-      - broker
-    ports:
-      - "8081:8081"
-    environment:
-      SCHEMA_REGISTRY_HOST_NAME: schema-registry
-      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'broker:29092'
-      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
 
   # Flink for transforming realtime
   flink-jobmanager:
@@ -89,15 +76,29 @@ services:
     - ../big_data/realtime_matching_pipeline/:/app
     networks:
       - ride-hailing-project
-  
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - ride-hailing-project
+    volumes:
+    - ./Grafana/data:/var/lib/grafana
+
   # Pipeline 1: realtime_matching
-  test_container:
-    container_name: test_container
+  gps-pipeline:
+    container_name: gps-pipeline
     build:
       context: ../big_data/realtime_matching_pipeline
       dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
     volumes:
       - ../big_data/realtime_matching_pipeline/:/app
+    networks:
+      - ride-hailing-project
 
 volumes:
   redis-data:
